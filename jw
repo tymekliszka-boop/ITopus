@@ -1,0 +1,337 @@
+// script.js — kompletny, bezpieczny skrypt z fallbackami i persistencją
+(function () {
+  'use strict';
+
+  // --- Konfiguracja storage ---
+  const STORAGE_KEY = 'itopus_state_v1';
+  const saveImages = true; // true konwertuje pliki na DataURL (może być ciężkie)
+
+  // --- Pomocnicze ---
+  function el(id) { return document.getElementById(id); }
+  function q(sel) { return document.querySelector(sel); }
+  function genId() { return Math.random().toString(36).slice(2, 10); }
+  function toast(text) { const t = el('toast'); if (t) { t.textContent = text; t.classList.add('show'); t.setAttribute('aria-hidden','false'); setTimeout(()=>{ t.classList.remove('show'); t.setAttribute('aria-hidden','true'); },2000);} }
+  function escapeHtml(s){ return String(s||'').replace(/[&<>"']/g, m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
+
+  // --- Aplikacja: stan ---
+  let items = []; // {id,file,fileName,url,dataUrl,title,category,description}
+  let pending = []; // batch upload temp
+  let editingId = null;
+
+  // --- Elementy odnajdziemy po DOMContentLoaded ---
+  document.addEventListener('DOMContentLoaded', () => {
+    // podstawowe elementy (można mieć dynamiczne id — wtedy dostosuj)
+    let chooseBtn = el('chooseFilesBtn') || Array.from(document.querySelectorAll('button')).find(b => (b.textContent||'').trim()==='Wybierz pliki') || null;
+    let fullscreenBtn = el('fullscreenBtn') || Array.from(document.querySelectorAll('button')).find(b => (b.textContent||'').trim()==='Pełny ekran') || null;
+    let dropzone = el('dropzone') || q('.uploader') || null;
+    let grid = el('grid') || q('.grid') || null;
+    let searchInput = el('searchInput') || q('input[type="search"]');
+    let categorySelect = el('categorySelect') || q('select');
+
+    // jeśli input file nie istnieje w DOM, tworzymy go (ukryty), by mieć pewny cel klików
+    let fileInput = el('fileInput') || document.querySelector('input[type="file"][accept*="image"]');
+    if (!fileInput) {
+      fileInput = document.createElement('input');
+      fileInput.type = 'file';
+      fileInput.accept = 'image/*';
+      fileInput.multiple = true;
+      fileInput.id = 'fileInput';
+      fileInput.style.display = 'none';
+      document.body.appendChild(fileInput);
+    }
+
+    // jeśli nie ma label-fallback, tworzymy niewidoczny label powiązany z inputem
+    if (!document.querySelector('label[for="fileInput"]')) {
+      const lbl = document.createElement('label');
+      lbl.setAttribute('for','fileInput');
+      lbl.style.display = 'none';
+      document.body.appendChild(lbl);
+    }
+
+    // Bezpieczne podpięcie przycisku "Wybierz pliki"
+    if (chooseBtn) {
+      chooseBtn.addEventListener('click', (e) => {
+        e.preventDefault();
+        try {
+          fileInput.value = '';
+          fileInput.focus();
+          // niektóre webview blokują programowy click; label for=fileInput jest fallback
+          const label = document.querySelector('label[for="fileInput"]');
+          try { fileInput.click(); } catch (_) { if (label) label.click(); }
+        } catch (err) {
+          console.error('Nie udało się otworzyć wyboru plików', err);
+          toast('Nie można otworzyć wyboru plików');
+        }
+      });
+    } else {
+      console.warn('Brak chooseFilesBtn w DOM');
+    }
+
+    // Obsługa zmiany plików — otwiera batch modal do uzupełnienia metadanych
+    fileInput.addEventListener('change', (ev) => {
+      if (ev.target && ev.target.files && ev.target.files.length) {
+        openBatchModal(ev.target.files);
+        fileInput.value = '';
+      }
+    });
+
+    // Drag & drop (jeśli dropzone istnieje)
+    if (dropzone) {
+      ['dragenter','dragover'].forEach(ev => dropzone.addEventListener(ev, (e) => { e.preventDefault(); dropzone.classList.add('drag'); }));
+      ['dragleave','drop'].forEach(ev => dropzone.addEventListener(ev, (e) => { e.preventDefault(); dropzone.classList.remove('drag'); }));
+      dropzone.addEventListener('drop', (e) => { e.preventDefault(); if (e.dataTransfer && e.dataTransfer.files) openBatchModal(e.dataTransfer.files); });
+    }
+
+    // Fullscreen bezpiecznie z fallbackami
+    if (fullscreenBtn) {
+      fullscreenBtn.addEventListener('click', async (e) => {
+        e.preventDefault();
+        try {
+          if (!document.fullscreenElement && !document.webkitFullscreenElement) {
+            if (document.documentElement.requestFullscreen) await document.documentElement.requestFullscreen();
+            else if (document.documentElement.webkitRequestFullscreen) document.documentElement.webkitRequestFullscreen();
+            else toast('Twoja przeglądarka nie wspiera pełnego ekranu');
+          } else {
+            if (document.exitFullscreen) await document.exitFullscreen();
+            else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+          }
+        } catch (err) {
+          console.error('Błąd pełnego ekranu:', err);
+          toast('Nie udało się przełączyć pełnego ekranu');
+        }
+      });
+    } else {
+      console.warn('Brak fullscreenBtn w DOM');
+    }
+
+    // batch modal i metody do edycji przed dodaniem
+    const batchModal = el('batchModal') || el('batchModal') || null;
+    const batchList = el('batchList') || null;
+    const batchClose = el('batchClose');
+    const batchCancel = el('batchCancel');
+    const batchAdd = el('batchAdd');
+
+    function openBatchModal(fileList) {
+      const files = Array.from(fileList).filter(f => f.type && f.type.startsWith('image/'));
+      if (!files.length) { toast('Brak obsługiwanych plików'); return; }
+      pending = files.map(f => ({ tempId: genId(), file: f, fileName: f.name, url: URL.createObjectURL(f), title:'', category:'', description:'' }));
+      renderBatchList();
+      if (batchModal) batchModal.setAttribute('aria-hidden','false');
+    }
+
+    function renderBatchList() {
+      if (!batchList) return;
+      batchList.innerHTML = '';
+      pending.forEach(p => {
+        const node = document.createElement('div');
+        node.className = 'batch-item';
+        node.innerHTML = `
+          <img class="batch-thumb" src="${p.url}" alt="${escapeHtml(p.fileName)}">
+          <div class="batch-fields">
+            <input data-id="${p.tempId}" class="batch-title" placeholder="Tytuł" value="${escapeHtml(p.title)}">
+            <select data-id="${p.tempId}" class="batch-category">
+              <option value="">Brak kategorii</option>
+              <option value="nature">Przyroda</option>
+              <option value="people">Ludzie</option>
+              <option value="architecture">Architektura</option>
+              <option value="abstract">Abstrakcja</option>
+            </select>
+            <textarea data-id="${p.tempId}" class="batch-desc" placeholder="Opis"></textarea>
+          </div>
+        `;
+        batchList.appendChild(node);
+      });
+
+      // attach listeners
+      batchList.querySelectorAll('.batch-title').forEach(inp => inp.addEventListener('input', e => {
+        const it = pending.find(x=>x.tempId===e.target.dataset.id); if(it) it.title = e.target.value;
+      }));
+      batchList.querySelectorAll('.batch-category').forEach(sel => sel.addEventListener('change', e => {
+        const it = pending.find(x=>x.tempId===e.target.dataset.id); if(it) it.category = e.target.value;
+      }));
+      batchList.querySelectorAll('.batch-desc').forEach(ta => ta.addEventListener('input', e => {
+        const it = pending.find(x=>x.tempId===e.target.dataset.id); if(it) it.description = e.target.value;
+      }));
+    }
+
+    if (batchClose) batchClose.addEventListener('click', ()=> batchModal && batchModal.setAttribute('aria-hidden','true'));
+    if (batchCancel) batchCancel.addEventListener('click', ()=> { pending.forEach(p=>URL.revokeObjectURL(p.url)); pending=[]; batchModal && batchModal.setAttribute('aria-hidden','true'); });
+    if (batchAdd) batchAdd.addEventListener('click', async () => {
+      // przenieś pending do items
+      for (const p of pending) {
+        const id = genId();
+        const it = { id, file: p.file, fileName: p.fileName, url: p.url, dataUrl: null, title: p.title.trim(), category: p.category, description: p.description.trim() };
+        if (saveImages) {
+          try { it.dataUrl = await fileToDataUrl(p.file); it.url = it.dataUrl; } catch(e){ console.warn('Konwersja pliku nie powiodła się', e); }
+        }
+        items.unshift(it);
+      }
+      pending = [];
+      if (batchModal) batchModal.setAttribute('aria-hidden','true');
+      render();
+      await saveState().catch(()=>{});
+      toast('Dodano zdjęcia do galerii');
+    });
+
+    // grid delegacja
+    if (grid) {
+      grid.addEventListener('click', (e) => {
+        const view = e.target.closest('.view');
+        if (view) { openMeta(view.dataset.id); return; }
+        const rem = e.target.closest('.remove');
+        if (rem) { removeItem(rem.dataset.id); return; }
+      });
+    }
+
+    // meta modal
+    const metaModal = el('metaModal') || null;
+    const metaPreview = el('metaPreview') || null;
+    const metaTitle = el('metaTitle') || null;
+    const metaCategory = el('metaCategory') || null;
+    const metaDescription = el('metaDescription') || null;
+    const metaSave = el('metaSave') || null;
+    const metaDelete = el('metaDelete') || null;
+    const modalClose = el('modalClose') || null;
+
+    function openMeta(id) {
+      const it = items.find(x => x.id === id); if (!it) return;
+      editingId = id;
+      if (metaPreview) metaPreview.src = it.url || it.dataUrl || '';
+      if (metaTitle) metaTitle.value = it.title || '';
+      if (metaCategory) metaCategory.value = it.category || '';
+      if (metaDescription) metaDescription.value = it.description || '';
+      if (metaModal) metaModal.setAttribute('aria-hidden','false');
+    }
+    if (modalClose) modalClose.addEventListener('click', ()=> { if (metaModal) metaModal.setAttribute('aria-hidden','true'); editingId=null; });
+    if (metaSave) metaSave.addEventListener('click', async ()=> {
+      if (!editingId) return;
+      const it = items.find(x=>x.id===editingId); if(!it) return;
+      if (metaTitle) it.title = metaTitle.value.trim();
+      if (metaCategory) it.category = metaCategory.value;
+      if (metaDescription) it.description = metaDescription.value.trim();
+      render();
+      await saveState().catch(()=>{});
+      if (metaModal) metaModal.setAttribute('aria-hidden','true');
+      editingId = null;
+      toast('Zapisano metadane');
+    });
+    if (metaDelete) metaDelete.addEventListener('click', ()=> { if(!editingId) return; removeItem(editingId); metaModal && metaModal.setAttribute('aria-hidden','true'); editingId=null; });
+
+    // render grid
+    function render() {
+      if (!grid) return;
+      grid.innerHTML = '';
+      const q = (searchInput && searchInput.value || '').trim().toLowerCase();
+      const cat = (categorySelect && categorySelect.value) || 'all';
+      for (const it of items) {
+        const name = (it.title || it.fileName || (it.file && it.file.name) || '').toLowerCase();
+        if (q && !name.includes(q) && !((it.fileName||'').toLowerCase().includes(q))) continue;
+        if (cat !== 'all' && it.category !== cat) continue;
+        const card = document.createElement('div');
+        card.className = 'card';
+        card.innerHTML = `
+          <img class="thumb" src="${it.url || it.dataUrl || ''}" alt="${escapeHtml(it.fileName || (it.file && it.file.name) || '')}">
+          <div class="card-meta">
+            <div>
+              <div class="title">${escapeHtml(it.title || it.fileName || (it.file && it.file.name) || '')}</div>
+              <div class="category">${escapeHtml(it.category || '')}</div>
+              <div class="desc" title="${escapeHtml(it.description||'')}" style="font-size:0.85rem;color:var(--muted)">${escapeHtml(it.description||'')}</div>
+            </div>
+            <div class="card-footer">
+              <button class="btn-small view" data-id="${it.id}">Podgląd</button>
+              <button class="btn-small remove" data-id="${it.id}">Usuń</button>
+            </div>
+          </div>
+        `;
+        grid.appendChild(card);
+      }
+      const pc = el('photoCount'); if (pc) pc.textContent = `${items.length} zdjęć`;
+    }
+
+    // remove
+    async function removeItem(id) {
+      const idx = items.findIndex(x => x.id === id); if (idx === -1) return;
+      try { URL.revokeObjectURL(items[idx].url); } catch {}
+      items.splice(idx,1);
+      render();
+      await saveState().catch(()=>{});
+      toast('Usunięto zdjęcie');
+    }
+
+    // search & filter handlers
+    if (searchInput) searchInput.addEventListener('input', render);
+    if (categorySelect) categorySelect.addEventListener('change', render);
+
+    // --- Persistencja stanu (localStorage) ---
+    function fileToDataUrl(file){
+      return new Promise((res,rej) => {
+        const fr = new FileReader();
+        fr.onload = () => res(fr.result);
+        fr.onerror = () => rej(new Error('FileReader error'));
+        fr.readAsDataURL(file);
+      });
+    }
+
+    async function saveState(){
+      try {
+        const serial = await Promise.all(items.map(async it => {
+          if (saveImages && it.file && !it.dataUrl) {
+            try { it.dataUrl = await fileToDataUrl(it.file); } catch(e){ console.warn('Konwersja nieudana',e); }
+          }
+          return {
+            id: it.id,
+            title: it.title || '',
+            category: it.category || '',
+            description: it.description || '',
+            dataUrl: saveImages ? (it.dataUrl || null) : null,
+            fileName: it.fileName || (it.file && it.file.name) || ''
+          };
+        }));
+        const state = { items: serial, filter: { q: (searchInput && searchInput.value) || '', category: (categorySelect && categorySelect.value) || 'all' }, ts: Date.now() };
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      } catch (err) { console.error('Błąd zapisu stanu', err); }
+    }
+
+    async function loadState() {
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (!raw) return;
+        const state = JSON.parse(raw);
+        if (!state || !Array.isArray(state.items)) return;
+        items = state.items.map(si => ({ id: si.id || genId(), file: null, fileName: si.fileName || '', url: si.dataUrl || '', dataUrl: si.dataUrl || null, title: si.title || '', category: si.category || '', description: si.description || '' }));
+        if (searchInput) searchInput.value = state.filter?.q || '';
+        if (categorySelect) categorySelect.value = state.filter?.category || 'all';
+        render();
+      } catch (err) { console.error('Błąd wczytywania stanu', err); }
+    }
+
+    // load saved state on start
+    loadState().catch(()=>{});
+    // save on unload minimal fallback
+    window.addEventListener('beforeunload', () => {
+      try {
+        const quick = { items: items.map(it => ({ id: it.id, title: it.title, category: it.category, description: it.description, dataUrl: it.dataUrl || null, fileName: it.fileName || '' })), filter: { q: (searchInput && searchInput.value) || '', category: (categorySelect && categorySelect.value) || 'all'}, ts: Date.now() };
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(quick));
+      } catch(e){}
+    });
+
+    // expose handleFiles for external code compatibility
+    window.handleFiles = (fileList) => openBatchModal(fileList);
+
+    // Initial render
+    render();
+
+    // Diagnostic info
+    console.info('ITopus script loaded. Elements:', { chooseBtn: !!chooseBtn, fullscreenBtn: !!fullscreenBtn, fileInput: !!fileInput, dropzone: !!dropzone, grid: !!grid });
+  });
+
+  // helper outside DOMContentLoaded (used in async parts)
+  function fileToDataUrl(file){
+    return new Promise((res,rej) => {
+      const fr = new FileReader();
+      fr.onload = () => res(fr.result);
+      fr.onerror = () => rej(new Error('FileReader error'));
+      fr.readAsDataURL(file);
+    });
+  }
+})();
